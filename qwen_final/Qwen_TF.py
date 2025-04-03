@@ -18,7 +18,7 @@ from transformers import logging
 
 #logging.set_verbosity_error()
 
-#from sampling.decoding import TriForce
+#from sampling.new_decoding import TriForce
 from sampling.new_decoding import TriForce
 from utils.misc import print_config
 
@@ -32,13 +32,13 @@ def parse_arguments():
     parser.add_argument('--verbose', action='store_true', help='verbose')
 
     parser.add_argument('--prefill', type=int, default=4096, help='prefill length')
-    parser.add_argument('--gen_len', type=int, default=40, help='generation length')
+    parser.add_argument('--gen_len', type=int, default=20, help='generation length')
     parser.add_argument('--gamma', type=int, default=6, help='gamma')
 
     #parser.add_argument('--dataset', type=str, default='gs', help='dataset')
     parser.add_argument('--temp', type=float, default=0.01, help='temperature')
     parser.add_argument('--top_p', type=float, default=0.9, help='top p')
-    parser.add_argument('--budget', type=int, default=256)
+    parser.add_argument('--budget', type=int, default=10000)
     parser.add_argument('--draft_cache_budget', type=int, default=512, help='draft cache budget')
     parser.add_argument('--chunk_size', type=int, default=64, help='chunk size')
     args = parser.parse_args()
@@ -60,28 +60,42 @@ if __name__ == "__main__":
 
     ######## model initialization ########
     print('Loading  draft  model...')
-    draft_model = Qwen2VLForConditionalGeneration_draft.from_pretrained(args.draft_model_path,torch_dtype = torch.float16,device_map="cuda:2")
+    draft_model = Qwen2VLForConditionalGeneration_draft.from_pretrained(args.draft_model_path,torch_dtype = torch.float16,device_map="cuda:3")
     draft = draft_model.eval()
     print('Loading  target  model...')
-    target_model = Qwen2VLForConditionalGeneration.from_pretrained(args.target_model_path,torch_dtype = torch.float16,device_map="cuda:2")
+    target_model = Qwen2VLForConditionalGeneration.from_pretrained(args.target_model_path,torch_dtype = torch.float16,device_map="cuda:3")
     target = target_model.eval()
     processor = AutoProcessor.from_pretrained(args.target_model_path)
 
     # Preparation for inference
+    # messages = [
+    #                         {
+    #                             "role": "user",
+    #                             "content": [
+    #                                 {"type":"image","image":"/data1/bks/liurunze/qwentest/image/dog.jpg"},
+    #                                 {"type": "text", "text": "Describe the image"},
+    #                             ],
+    #                         }
+    #                     ]
+    # text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # image_inputs, video_inputs = process_vision_info(messages)
+    # inputs = processor(text=[text],images=image_inputs,videos=video_inputs,padding=True,return_tensors="pt",)
+    # inputs = inputs.to(target_model.device)
     messages = [
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type":"image","image":"/data1/bks/liurunze/qwentest/image/dog.jpg"},
-                                    {"type": "text", "text": "Describe the image"},
+                                    {"type":"video","video":"/data1/bks/liurunze/qwen_final/video/1.mp4"},
+                                    {"type": "text", "text": "Describe the video"},
                                 ],
                             }
                         ]
+
+
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(text=[text],images=image_inputs,videos=video_inputs,padding=True,return_tensors="pt",)
-    inputs = inputs.to(target_model.device)
-    
+    inputs = inputs.to(draft_model.device)
     ######## sampling parameters ########
     top_k = -1
     top_p = args.top_p
@@ -102,7 +116,7 @@ if __name__ == "__main__":
     recent_size = draft_cache_budget - 16 - gamma
 
     cache =FlashSimpleCache(target, inputs.input_ids.shape[1]+gen_len+32)
-    graph_cache = RetrievalCache(target, max_budget=max_budget, prefill=inputs.input_ids.shape[1], gamma=gamma, chunk_size=chunk_size)
+    graph_cache = RetrievalCache(target, max_budget=256, prefill=inputs.input_ids.shape[1], gamma=gamma, chunk_size=chunk_size)
     draft_cache = StreamingLLMEvictionCache(draft, start_size=16, recent_size=recent_size, gamma=gamma)
 
     # graph_engine = GraphInferenceEngine(target, cache, graph_cache, draft, draft_cache)
@@ -110,7 +124,7 @@ if __name__ == "__main__":
 
     cache.print_status()
     graph_cache.print_status()
-    #draft_cache.print_status()
+    draft_cache.print_status()
     print(colored(f"tokenized_prompts length: {inputs.input_ids.shape[1]}", "green"))
 
     n_warmups = 1
@@ -160,11 +174,11 @@ if __name__ == "__main__":
         #input_ids = input_ids.to(target.device)[:,:prefill]
 
         #acceptance_rate, speed,text = TriForce(processor, graph_engine=graph_engine,inputs=inputs, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=False )
-        acceptance_rate, speed,text = TriForce(processor, target=target,cache=cache,graph_cache=graph_cache,inputs=inputs, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=False )
+        acceptance_rate, speed,text = TriForce(processor, target=target,cache=cache,graph_cache=graph_cache,draft=draft,draft_cache=draft_cache,inputs=inputs, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=False )
         all_acceptance_rate.append(acceptance_rate)
         all_speed.append(speed)
-
-    method_latency = 1000/(sum(all_speed) / len(all_speed))
+    print(speed)
+    #method_latency = 1000/(sum(all_speed) / len(all_speed))
     print(colored(f"average acceptance rate (NOT per token): {sum(all_acceptance_rate) / len(all_acceptance_rate)}", "red"))
-    print(colored(f"[TriForce] average latency: {method_latency} ms", "red"))
+    #print(colored(f"[TriForce] average latency: {method_latency} ms", "red"))
     print(text)

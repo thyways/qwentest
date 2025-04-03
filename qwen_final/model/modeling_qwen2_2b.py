@@ -15,7 +15,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import(
 from transformers.modeling_outputs import CausalLMOutputWithPast,ModelOutput
 #from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from torch.nn import LayerNorm
-
+from flash_attn import flash_attn_varlen_func
 from flash_attn import flash_attn_with_kvcache
 
 from model.config_yarn_new import Qwen2VLConfig,Qwen2VLVisionConfig
@@ -92,42 +92,7 @@ class VisionMlp(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    # def __init__(self, dim: int, num_heads: int = 16) -> None:
-    #     super().__init__()
-    #     self.num_heads = num_heads
-    #     self.head_dim = dim // num_heads
-    #     self.qkv = nn.Linear(dim, dim * 3, bias=True)
-    #     self.proj = nn.Linear(dim, dim)
-
-    # def forward(
-    #     self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, rotary_pos_emb: torch.Tensor = None
-    # ) -> torch.Tensor:
-    #     seq_length = hidden_states.shape[0]
-    #     qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
-    #     q, k, v = qkv.unbind(0)
-    #     q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-    #     k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-    #     # 构造 attention mask（块数通常较少，此处循环不会成为性能瓶颈）
-    #     attention_mask = torch.full(
-    #         [1, seq_length, seq_length],
-    #         torch.finfo(q.dtype).min,
-    #         device=q.device,
-    #         dtype=q.dtype,
-    #     )
-    #     for i in range(1, len(cu_seqlens)):
-    #         start = cu_seqlens[i - 1]
-    #         end = cu_seqlens[i]
-    #         attention_mask[..., start:end, start:end] = 0
-    #     q = q.transpose(0, 1)
-    #     k = k.transpose(0, 1)
-    #     v = v.transpose(0, 1)
-    #     attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
-    #     attn_weights = attn_weights + attention_mask
-    #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-    #     attn_output = torch.matmul(attn_weights, v)
-    #     attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1)
-    #     attn_output = self.proj(attn_output)
-    #     return attn_output
+    
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -142,15 +107,10 @@ class VisionAttention(nn.Module):
         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
 
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+            seq_length, -1
+        )
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -320,18 +280,7 @@ class Qwen2VLAttention(nn.Module):
             
             kv_seq_len = gamma_offset + graph_cache.start_size + graph_cache.recent_size + 1
 
-            # query_states = query_states.transpose(1, 2)
-            # key_states = key_states.transpose(1, 2)
-        #dropout_rate = 0.0 if not self.training else self.attention_dropout
-        # 更新 kv cache 或 graph cache（保证内部所有张量在 device 上）
-        # if spec:  # spec decoding
-        #     new_k_states = key_states
-        #     new_k_states = new_k_states.transpose(1,2)
-        #     new_v_states = value_states
-        #     new_v_states = new_v_states.transpose(1,2)
-        #     new_k_states = repeat_kv(new_k_states,self.num_key_value_groups)
-        #     new_v_states = repeat_kv(new_v_states,self.num_key_value_groups)
-        #     key_states, value_states = graph_cache.update(new_k_cache=new_k_states, new_v_cache=new_v_states, layer_idx=self.layer_idx)
+            
         else:
             kv_seq_len = key_states.shape[-3]
             kv_seq_len += kv_cache.seq_len
@@ -593,6 +542,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        #self.layer = Qwen2VLDecoderLayer(config)
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
 
@@ -638,6 +588,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         hidden_states = inputs_embeds
         
         # 按层执行 decoder 层计算
+        
         for decoder_layer in self.layers:
             outputs = decoder_layer(
                 hidden_states,
@@ -647,7 +598,6 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 graph_cache=graph_cache,
                 storage_ids=storage_ids,
                 gamma_offset=gamma_offset,
-                
             )
             hidden_states=outputs
         

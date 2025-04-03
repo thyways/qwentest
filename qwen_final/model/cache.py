@@ -309,14 +309,14 @@ class RetrievalCache(Cache):
         
         # new_k_cache = new_k_cache.transpose(1,2)
         # new_v_cache = new_v_cache.transpose(1,2)
-        self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:self.real_budget-self.gamma] = new_k_cache.clone()
-        self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:self.real_budget-self.gamma] = new_v_cache.clone()
-        # self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_k_cache.clone()
-        # self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_v_cache.clone()
-        if layer_idx==self.layers-1:
-            self.gamma-=1
-        if(self.gamma==0):
-            self.gamma=6
+        # self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:self.real_budget-self.gamma] = new_k_cache.clone()
+        # self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:self.real_budget-self.gamma] = new_v_cache.clone()
+        self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_k_cache.clone()
+        self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_v_cache.clone()
+        # if layer_idx==self.layers-1:
+        #     self.gamma-=1
+        # if(self.gamma==0):
+        #     self.gamma=6
         return self.key_cache[layer_idx][:,:self.real_budget], self.value_cache[layer_idx][:,:self.real_budget]
 
     def update_graph_cache_retrieval(self, kv_cache,k_states,v_states,query_states, layer_idx):

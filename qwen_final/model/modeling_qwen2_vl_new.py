@@ -9,9 +9,10 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import(
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
     ACT2FN,
+    Qwen2VLRotaryEmbedding
     
 )
-
+from flash_attn import flash_attn_varlen_func
 from transformers.modeling_outputs import CausalLMOutputWithPast,ModelOutput
 #from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from torch.nn import LayerNorm
@@ -92,42 +93,7 @@ class VisionMlp(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    # def __init__(self, dim: int, num_heads: int = 16) -> None:
-    #     super().__init__()
-    #     self.num_heads = num_heads
-    #     self.head_dim = dim // num_heads
-    #     self.qkv = nn.Linear(dim, dim * 3, bias=True)
-    #     self.proj = nn.Linear(dim, dim)
-
-    # def forward(
-    #     self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, rotary_pos_emb: torch.Tensor = None
-    # ) -> torch.Tensor:
-    #     seq_length = hidden_states.shape[0]
-    #     qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
-    #     q, k, v = qkv.unbind(0)
-    #     q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-    #     k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-    #     # 构造 attention mask（块数通常较少，此处循环不会成为性能瓶颈）
-    #     attention_mask = torch.full(
-    #         [1, seq_length, seq_length],
-    #         torch.finfo(q.dtype).min,
-    #         device=q.device,
-    #         dtype=q.dtype,
-    #     )
-    #     for i in range(1, len(cu_seqlens)):
-    #         start = cu_seqlens[i - 1]
-    #         end = cu_seqlens[i]
-    #         attention_mask[..., start:end, start:end] = 0
-    #     q = q.transpose(0, 1)
-    #     k = k.transpose(0, 1)
-    #     v = v.transpose(0, 1)
-    #     attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
-    #     attn_weights = attn_weights + attention_mask
-    #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-    #     attn_output = torch.matmul(attn_weights, v)
-    #     attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1)
-    #     attn_output = self.proj(attn_output)
-    #     return attn_output
+    
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -142,15 +108,10 @@ class VisionAttention(nn.Module):
         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
 
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+            seq_length, -1
+        )
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -169,39 +130,39 @@ class Qwen2VLVisionBlock(nn.Module):
         return hidden_states
 
 
-class Qwen2VLRotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim=128,
-        base=10000,
-        max_position_embeddings=2048,
-        device: torch.device = None,
-        config: Optional[Qwen2VLConfig] = None,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.base = base
-        self.max_position_embeddings = max_position_embeddings
-        self.config = config
-        device = device if device is not None else torch.device("cpu")
-        # 初始化频率，直接创建在指定 device 上
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+# class Qwen2VLRotaryEmbedding(nn.Module):
+#     def __init__(
+#         self,
+#         dim=128,
+#         base=10000,
+#         max_position_embeddings=2048,
+#         device: torch.device = None,
+#         config: Optional[Qwen2VLConfig] = None,
+#     ):
+#         super().__init__()
+#         self.dim = dim
+#         self.base = base
+#         self.max_position_embeddings = max_position_embeddings
+#         self.config = config
+#         device = device if device is not None else torch.device("cpu")
+#         # 初始化频率，直接创建在指定 device 上
+#         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+#         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x, position_ids):
-        # 扩展 inv_freq 到 (3, 1, dim//2, 1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
-        # 调整 position_ids 维度到 (3, bs, 1, seq_len)
-        position_ids_expanded = position_ids[:, :, None, :].float()
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
+#     def forward(self, x, position_ids):
+#         # 扩展 inv_freq 到 (3, 1, dim//2, 1)
+#         inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
+#         # 调整 position_ids 维度到 (3, bs, 1, seq_len)
+#         position_ids_expanded = position_ids[:, :, None, :].float()
+#         device_type = x.device.type
+#         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+#         with torch.autocast(device_type=x.device.type, enabled=False):
+#             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+#             emb = torch.cat((freqs, freqs), dim=-1)
+#             cos = emb.cos()
+#             sin = emb.sin()
         
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+#         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -473,7 +434,6 @@ class Qwen2VLPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-
 class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
     config_class = Qwen2VLVisionConfig
     _no_split_modules = ["Qwen2VLVisionBlock"]
@@ -505,79 +465,152 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
     def get_device(self) -> torch.device:
         return self.blocks[0].mlp.fc2.weight.device
 
-    def _compute_single_sample_pos_ids(self, t: int, h: int, w: int) -> torch.Tensor:
-        """
-        计算单个样本的二维位置索引，并重复 t 次得到最终位置索引矩阵。
-        利用 reshape 和 permute 实现对 h 和 w 方向的分块处理。
-        """
-        # 使用模型所在设备
-        device = self.get_device()
-        # 构造 h, w 索引矩阵
-        h_range = torch.arange(h, device=device).unsqueeze(1).expand(h, w)
-        w_range = torch.arange(w, device=device).unsqueeze(0).expand(h, w)
-        # 将 h, w 重塑为 (h_merge, merge, w_merge, merge) 格式
-        h_merge = h // self.spatial_merge_size
-        w_merge = w // self.spatial_merge_size
-        h_indices = h_range.reshape(h_merge, self.spatial_merge_size, w_merge, self.spatial_merge_size)
-        w_indices = w_range.reshape(h_merge, self.spatial_merge_size, w_merge, self.spatial_merge_size)
-        # 调整维度顺序，并展平每个 patch grid
-        h_indices = h_indices.permute(0, 2, 1, 3).flatten()
-        w_indices = w_indices.permute(0, 2, 1, 3).flatten()
-        # 拼接 h 和 w 索引，得到形状 (num_tokens, 2)
-        pos_ids = torch.stack([h_indices, w_indices], dim=-1)
-        # 重复 t 次，代表 t 帧或 t 个视觉样本
-        return pos_ids.repeat(t, 1)
+    def rot_pos_emb(self, grid_thw):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
 
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """
-        grid_thw: Tensor，每行格式为 (t, h, w)
-        计算所有样本的二维位置索引，并利用 VisionRotaryEmbedding 得到最终 rotary positional embeddings。
-        """
-        device = grid_thw.device
-        pos_ids_list = []
-        # 利用 unbind 遍历每个样本（避免使用 tolist() 转换成 python list）
-        for row in grid_thw.unbind(dim=0):
-            # row 为形状 (3,) 的 tensor，转换为 Python 标量（仅 3 个数字，开销可忽略）
-            t = int(row[0].item())
-            h = int(row[1].item())
-            w = int(row[2].item())
-            pos_ids_sample = self._compute_single_sample_pos_ids(t, h, w)
-            pos_ids_list.append(pos_ids_sample.to(device))
-        # 拼接所有样本的二维位置索引，形状为 (total_tokens, 2)
-        pos_ids = torch.cat(pos_ids_list, dim=0)
-        # 取 grid_thw 中 h, w 的最大值作为索引范围
-        max_grid_size = int(grid_thw[:, 1:].max().item())
-        # 计算全量的 rotary embedding，形状例如 (max_grid_size, embedding_dim)
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        # 使用 pos_ids 对 rotary_pos_emb_full 进行索引，并展平最后一维
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """
-        hidden_states: 原始图像（或视频帧）输入
-        grid_thw: 每个样本的 (t, h, w) 信息，决定视觉特征图的尺寸（应位于同一设备上）
-        """
-        device = self.get_device()
-        # 确保输入都在模型所在设备上
-        hidden_states = hidden_states.to(device)
-        grid_thw = grid_thw.to(device)
-
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        # 计算每个样本的累计序列长度（cu_seqlens）
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2],
-            grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0, dtype=torch.int32
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        # 依次通过所有视觉 transformer block
         for blk in self.blocks:
             hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
 
         return self.merger(hidden_states)
+# class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
+#     config_class = Qwen2VLVisionConfig
+#     _no_split_modules = ["Qwen2VLVisionBlock"]
+
+#     def __init__(self, config) -> None:
+#         super().__init__(config)
+#         self.spatial_merge_size = config.spatial_merge_size
+
+#         self.patch_embed = PatchEmbed(
+#             patch_size=config.patch_size,
+#             temporal_patch_size=config.temporal_patch_size,
+#             in_channels=config.in_channels,
+#             embed_dim=config.embed_dim,
+#         )
+
+#         head_dim = config.embed_dim // config.num_heads
+#         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
+
+#         self.blocks = nn.ModuleList(
+#             [Qwen2VLVisionBlock(config, config._attn_implementation) for _ in range(config.depth)]
+#         )
+#         self.merger = PatchMerger(
+#             dim=config.hidden_size, context_dim=config.embed_dim, spatial_merge_size=config.spatial_merge_size
+#         )
+
+#     def get_dtype(self) -> torch.dtype:
+#         return self.blocks[0].mlp.fc2.weight.dtype
+
+#     def get_device(self) -> torch.device:
+#         return self.blocks[0].mlp.fc2.weight.device
+
+#     def _compute_single_sample_pos_ids(self, t: int, h: int, w: int) -> torch.Tensor:
+#         """
+#         计算单个样本的二维位置索引，并重复 t 次得到最终位置索引矩阵。
+#         利用 reshape 和 permute 实现对 h 和 w 方向的分块处理。
+#         """
+#         # 使用模型所在设备
+#         device = self.get_device()
+#         # 构造 h, w 索引矩阵
+#         h_range = torch.arange(h, device=device).unsqueeze(1).expand(h, w)
+#         w_range = torch.arange(w, device=device).unsqueeze(0).expand(h, w)
+#         # 将 h, w 重塑为 (h_merge, merge, w_merge, merge) 格式
+#         h_merge = h // self.spatial_merge_size
+#         w_merge = w // self.spatial_merge_size
+#         h_indices = h_range.reshape(h_merge, self.spatial_merge_size, w_merge, self.spatial_merge_size)
+#         w_indices = w_range.reshape(h_merge, self.spatial_merge_size, w_merge, self.spatial_merge_size)
+#         # 调整维度顺序，并展平每个 patch grid
+#         h_indices = h_indices.permute(0, 2, 1, 3).flatten()
+#         w_indices = w_indices.permute(0, 2, 1, 3).flatten()
+#         # 拼接 h 和 w 索引，得到形状 (num_tokens, 2)
+#         pos_ids = torch.stack([h_indices, w_indices], dim=-1)
+#         # 重复 t 次，代表 t 帧或 t 个视觉样本
+#         return pos_ids.repeat(t, 1)
+
+#     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+#         """
+#         grid_thw: Tensor，每行格式为 (t, h, w)
+#         计算所有样本的二维位置索引，并利用 VisionRotaryEmbedding 得到最终 rotary positional embeddings。
+#         """
+#         device = grid_thw.device
+#         pos_ids_list = []
+#         # 利用 unbind 遍历每个样本（避免使用 tolist() 转换成 python list）
+#         for row in grid_thw.unbind(dim=0):
+#             # row 为形状 (3,) 的 tensor，转换为 Python 标量（仅 3 个数字，开销可忽略）
+#             t = int(row[0].item())
+#             h = int(row[1].item())
+#             w = int(row[2].item())
+#             pos_ids_sample = self._compute_single_sample_pos_ids(t, h, w)
+#             pos_ids_list.append(pos_ids_sample.to(device))
+#         # 拼接所有样本的二维位置索引，形状为 (total_tokens, 2)
+#         pos_ids = torch.cat(pos_ids_list, dim=0)
+#         # 取 grid_thw 中 h, w 的最大值作为索引范围
+#         max_grid_size = int(grid_thw[:, 1:].max().item())
+#         # 计算全量的 rotary embedding，形状例如 (max_grid_size, embedding_dim)
+#         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+#         # 使用 pos_ids 对 rotary_pos_emb_full 进行索引，并展平最后一维
+#         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+#         return rotary_pos_emb
+
+#     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+#         """
+#         hidden_states: 原始图像（或视频帧）输入
+#         grid_thw: 每个样本的 (t, h, w) 信息，决定视觉特征图的尺寸（应位于同一设备上）
+#         """
+#         device = self.get_device()
+#         # 确保输入都在模型所在设备上
+#         hidden_states = hidden_states.to(device)
+#         grid_thw = grid_thw.to(device)
+
+#         hidden_states = self.patch_embed(hidden_states)
+#         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+#         # 计算每个样本的累计序列长度（cu_seqlens）
+#         cu_seqlens = torch.repeat_interleave(
+#             grid_thw[:, 1] * grid_thw[:, 2],
+#             grid_thw[:, 0]
+#         ).cumsum(dim=0, dtype=torch.int32)
+#         cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+
+#         # 依次通过所有视觉 transformer block
+#         for blk in self.blocks:
+#             hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+
+#         return self.merger(hidden_states)
 
 
 class Qwen2VLModel(Qwen2VLPreTrainedModel):
@@ -998,24 +1031,42 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel):
         # 若未传入 inputs_embeds，则先从 token embedding 获取
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
-            # 封装一个辅助函数处理视觉输入替换
-            def replace_tokens(token_id, pixel_vals, grid_thw):
-                if pixel_vals is not None:
-                    pixel_vals = pixel_vals.type(self.visual.get_dtype()).to(inputs_embeds.device)
-                    visual_embeds = self.visual(pixel_vals, grid_thw=grid_thw)
-                    n_tokens = (input_ids == token_id).sum().item()
-                    if n_tokens != visual_embeds.shape[0]:
-                        raise ValueError(f"Image/video tokens and features mismatch: tokens {n_tokens}, features {visual_embeds.shape[0]}")
-                    mask = (input_ids == token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                    return inputs_embeds.masked_scatter(mask, visual_embeds)
-                return inputs_embeds
-            
-            inputs_embeds = replace_tokens(self.config.image_token_id, pixel_values, image_grid_thw)
-            inputs_embeds = replace_tokens(self.config.video_token_id, pixel_values_videos, video_grid_thw)
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.get_dtype()).to(inputs_embeds.device)
+                pixel_values = pixel_values.type(self.visual.get_dtype())
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+                n_image_features = image_embeds.shape[0]
+                if n_image_tokens != n_image_features:
+                    raise ValueError(
+                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                    )
+                image_mask = (
+                    (input_ids == self.config.image_token_id)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
             if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype()).to(inputs_embeds.device)
+                pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                n_video_features = video_embeds.shape[0]
+                if n_video_tokens != n_video_features:
+                    raise ValueError(
+                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                    )
+                video_mask = (
+                    (input_ids == self.config.video_token_id)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
@@ -1039,7 +1090,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel):
                     if spec:
                         batch_size, seq_length, _ = inputs_embeds.shape
                         #_,rope_deltas = self.get_rope_index(input_ids=input_ids)
-                        delta = torch.tensor(kv_cache.seq_len+gamma_offset) + self.rope_deltas if graph_cache is not None else 0
+                        delta = torch.tensor(kv_cache.seq_len) + self.rope_deltas if graph_cache is not None else 0
                         position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                         position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                         if graph_cache is not None:  # otherwise `deltas` is an int `0`
